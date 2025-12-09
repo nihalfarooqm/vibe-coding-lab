@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Particles: AI Hand Tracking</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        /* --- RESET & BASIC SETUP --- */
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Inter', sans-serif; }
+        canvas { display: block; }
+        #video-input { display: none; } /* Hide raw webcam feed */
+
+        /* --- START OVERLAY --- */
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 2000; color: white; text-align: center;
+        }
+        #start-btn {
+            margin-top: 20px; padding: 15px 40px; font-size: 1.2rem;
+            background: linear-gradient(135deg, #00d2ff 0%, #3a7bd5 100%);
+            border: none; border-radius: 30px; color: white; cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            font-weight: 600; letter-spacing: 1px;
+        }
+        #start-btn:hover { transform: scale(1.05); box-shadow: 0 0 20px rgba(0, 210, 255, 0.6); }
+        .warning { font-size: 0.9rem; color: #888; margin-top: 15px; max-width: 400px; line-height: 1.5; }
+
+        /* --- MODERN UI PANEL (Glassmorphism) --- */
+        #ui-container {
+            position: absolute; top: 20px; right: 20px; width: 280px;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px; padding: 20px;
+            color: white; z-index: 100;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+            display: none; /* Hidden until started */
+        }
+        
+        .control-group { margin-bottom: 20px; }
+        .control-group label { display: block; font-size: 0.85rem; color: #ccc; margin-bottom: 8px; font-weight: 400; }
+        
+        /* Custom Select */
+        select {
+            width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.4); color: white; font-family: inherit; outline: none;
+            cursor: pointer; transition: 0.3s;
+        }
+        select:hover { background: rgba(0,0,0,0.6); }
+
+        /* Custom Slider */
+        input[type=range] {
+            width: 100%; -webkit-appearance: none; background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; height: 16px; width: 16px; border-radius: 50%;
+            background: #00d2ff; cursor: pointer; margin-top: -6px;
+            box-shadow: 0 0 10px rgba(0, 210, 255, 0.8);
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%; height: 4px; cursor: pointer; background: rgba(255,255,255,0.2); border-radius: 2px;
+        }
+
+        #status {
+            font-size: 0.75rem; color: #00d2ff; margin-top: 10px; text-align: center;
+        }
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/vision_bundle.js"></script>
+</head>
+<body>
+
+    <div id="start-screen">
+        <h1>✨ Vibe Particles</h1>
+        <p>Interactive AI Hand Tracking</p>
+        <button id="start-btn">ENABLE CAMERA & START</button>
+        <div class="warning">
+            Note: If camera doesn't start, please ensure you are running this on a local server (http://localhost) or https, not directly from a file folder.
+        </div>
+    </div>
+
+    <div id="ui-container">
+        <div class="control-group">
+            <label for="shape-select">FORMATION SHAPE</label>
+            <select id="shape-select">
+                <option value="Sphere">Sphere</option>
+                <option value="Cube">Cube</option>
+                <option value="Torus">Torus</option>
+                <option value="Helix">Helix</option>
+                <option value="Spiral">Spiral</option>
+                <option value="Cone">Cone</option>
+                <option value="Pyramid">Pyramid</option>
+                <option value="Grid">Grid</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label for="count-slider">PARTICLE COUNT: <span id="count-display">15000</span></label>
+            <input type="range" id="count-slider" min="500" max="50000" step="500" value="15000">
+        </div>
+        <div id="status">Waiting for input...</div>
+    </div>
+
+    <video id="video-input" autoplay playsinline></video>
+
+<script>
+/**
+ * ----------------------------------------------------------------------
+ * GLOBAL STATE
+ * ----------------------------------------------------------------------
+ */
+const CONFIG = {
+    particleCount: 15000,
+    shape: 'Sphere',
+    color: 0x00ffff,
+    baseSize: 0.15,
+    trailStrength: 0.15 
+};
+
+let scene, camera, renderer, particles, geometry, material;
+let targetPositions = [];
+let currentPositions = [];
+let velocities = [];
+let handLandmarker = null;
+let webcamRunning = false;
+let handPosition = new THREE.Vector3(0, 0, 0); // Target attractor
+let isHandDetected = false;
+let mouse = new THREE.Vector2();
+
+/**
+ * ----------------------------------------------------------------------
+ * 1. INITIALIZATION FLOW
+ * ----------------------------------------------------------------------
+ */
+const startBtn = document.getElementById('start-btn');
+const startScreen = document.getElementById('start-screen');
+const uiContainer = document.getElementById('ui-container');
+
+startBtn.addEventListener('click', async () => {
+    startBtn.innerText = "INITIALIZING...";
+    
+    // 1. Init 3D Scene
+    initThreeJS();
+    
+    // 2. Try Init AI
+    await setupMediaPipe();
+    
+    // 3. UI Transition
+    startScreen.style.opacity = 0;
+    setTimeout(() => { startScreen.style.display = 'none'; uiContainer.style.display = 'block'; }, 500);
+    
+    // 4. Start Loop
+    animate();
+});
+
+// Setup UI Event Listeners
+document.getElementById('shape-select').addEventListener('change', (e) => {
+    CONFIG.shape = e.target.value;
+    generateShapeTargets();
+});
+
+document.getElementById('count-slider').addEventListener('input', (e) => {
+    document.getElementById('count-display').innerText = e.target.value;
+});
+
+document.getElementById('count-slider').addEventListener('change', (e) => {
+    CONFIG.particleCount = parseInt(e.target.value);
+    initParticles();
+});
+
+// Mouse fallback
+document.addEventListener('mousemove', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    
+    if (!webcamRunning && !isHandDetected) {
+        // If no camera, use mouse as attractor
+        handPosition.set(mouse.x * 30, mouse.y * 20, 0);
+    }
+});
+
+
+/**
+ * ----------------------------------------------------------------------
+ * 2. THREE.JS SETUP
+ * ----------------------------------------------------------------------
+ */
+function initThreeJS() {
+    scene = new THREE.Scene();
+    
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 35;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.autoClear = false; // Essential for trails
+    document.body.appendChild(renderer.domElement);
+
+    // Initial Particle Gen
+    initParticles();
+    
+    window.addEventListener('resize', onWindowResize, false);
+}
+
+function initParticles() {
+    if (particles) {
+        scene.remove(particles);
+        geometry.dispose();
+        material.dispose();
+    }
+
+    const count = CONFIG.particleCount;
+    geometry = new THREE.BufferGeometry();
+    currentPositions = new Float32Array(count * 3);
+    targetPositions = new Float32Array(count * 3);
+    velocities = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+
+    const colorObj = new THREE.Color(CONFIG.color);
+
+    for (let i = 0; i < count; i++) {
+        // Random start positions
+        currentPositions[i*3] = (Math.random() - 0.5) * 50;
+        currentPositions[i*3+1] = (Math.random() - 0.5) * 50;
+        currentPositions[i*3+2] = (Math.random() - 0.5) * 50;
+        
+        // Colors
+        colors[i*3] = colorObj.r;
+        colors[i*3+1] = colorObj.g;
+        colors[i*3+2] = colorObj.b;
+        
+        sizes[i] = CONFIG.baseSize;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    // Shader for particles (Glowy Dots)
+    material = new THREE.ShaderMaterial({
+        uniforms: {
+            pointTexture: { value: new THREE.TextureLoader().load("https://threejs.org/examples/textures/sprites/spark1.png") }
+        },
+        vertexShader: `
+            attribute float size;
+            attribute vec3 color;
+            varying vec3 vColor;
+            void main() {
+                vColor = color;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `,
+        fragmentShader: `
+            uniform sampler2D pointTexture;
+            varying vec3 vColor;
+            void main() {
+                gl_FragColor = vec4(vColor, 1.0);
+                gl_FragColor = gl_FragColor * texture2D(pointTexture, gl_PointCoord);
+            }
+        `,
+        blending: THREE.AdditiveBlending,
+        depthTest: false,
+        transparent: true
+    });
+
+    particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+
+    generateShapeTargets();
+}
+
+/**
+ * ----------------------------------------------------------------------
+ * 3. SHAPE MATH
+ * ----------------------------------------------------------------------
+ */
+function generateShapeTargets() {
+    const count = CONFIG.particleCount;
+    const shape = CONFIG.shape;
+    const size = 12; 
+
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        let x = 0, y = 0, z = 0;
+
+        // --- MATH SHAPES ---
+        if (shape === 'Sphere') {
+            const r = size * Math.cbrt(Math.random());
+            const theta = Math.random() * 2 * Math.PI;
+            const phi = Math.acos(2 * Math.random() - 1);
+            x = r * Math.sin(phi) * Math.cos(theta);
+            y = r * Math.sin(phi) * Math.sin(theta);
+            z = r * Math.cos(phi);
+        } else if (shape === 'Cube') {
+            x = (Math.random() - 0.5) * size * 2;
+            y = (Math.random() - 0.5) * size * 2;
+            z = (Math.random() - 0.5) * size * 2;
+        } else if (shape === 'Torus') {
+            const R = size * 0.7; const r = size * 0.3;
+            const u = Math.random() * Math.PI * 2;
+            const v = Math.random() * Math.PI * 2;
+            x = (R + r * Math.cos(v)) * Math.cos(u);
+            y = (R + r * Math.cos(v)) * Math.sin(u);
+            z = r * Math.sin(v);
+        } else if (shape === 'Helix') {
+            const t = i / count * 10 * Math.PI; 
+            x = (size * 0.6) * Math.cos(t);
+            y = (size * 0.6) * Math.sin(t);
+            z = (i / count - 0.5) * size * 3;
+        } else if (shape === 'Spiral') {
+            const angle = i * 0.1;
+            const radius = Math.sqrt(i) / Math.sqrt(count) * size * 1.5;
+            x = radius * Math.cos(angle);
+            y = radius * Math.sin(angle);
+            z = 0;
+        } else if (shape === 'Cone') {
+            const h = size * 2; const y_norm = Math.random();
+            const r = (1 - y_norm) * size;
+            const theta = Math.random() * 2 * Math.PI;
+            x = r * Math.cos(theta); y = y_norm * h - h/2; z = r * Math.sin(theta);
+        } else if (shape === 'Pyramid') {
+            const h = size * 2; const y_norm = Math.random();
+            const r = (1 - y_norm) * size;
+            x = (Math.random() - 0.5) * 2 * r; z = (Math.random() - 0.5) * 2 * r; y = y_norm * h - h/2;
+        } else if (shape === 'Grid') {
+            const dim = Math.floor(Math.cbrt(count));
+            const spacing = size * 2 / dim;
+            const ix = i % dim;
+            const iy = Math.floor((i / dim)) % dim;
+            const iz = Math.floor(i / (dim * dim));
+            x = ix * spacing - size; y = iy * spacing - size; z = iz * spacing - size;
+        }
+
+        targetPositions[i3] = x;
+        targetPositions[i3+1] = y;
+        targetPositions[i3+2] = z;
+    }
+}
+
+/**
+ * ----------------------------------------------------------------------
+ * 4. MEDIAPIPE LOGIC
+ * ----------------------------------------------------------------------
+ */
+async function setupMediaPipe() {
+    const statusDiv = document.getElementById('status');
+    statusDiv.innerText = "Loading AI Model...";
+
+    try {
+        const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+        );
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                delegate: "GPU"
+            },
+            runningMode: "VIDEO",
+            numHands: 1
+        });
+
+        statusDiv.innerText = "Requesting Camera...";
+        const video = document.getElementById("video-input");
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", () => {
+            webcamRunning = true;
+            statusDiv.innerText = "● Tracking Active";
+            statusDiv.style.color = "#00ff88";
+        });
+    } catch (err) {
+        console.error(err);
+        statusDiv.innerText = "Camera Failed (Check Console)";
+        statusDiv.style.color = "#ff4444";
+        alert("Could not start camera. Using Mouse Mode instead.");
+    }
+}
+
+async function detectHands() {
+    if (!handLandmarker || !webcamRunning) return;
+    const video = document.getElementById("video-input");
+    
+    if (video.currentTime > 0) {
+        const results = await handLandmarker.detectForVideo(video, performance.now());
+        
+        if (results.landmarks && results.landmarks.length > 0) {
+            isHandDetected = true;
+            const lm = results.landmarks[0][8]; // Index Tip
+            // Map 2D video to 3D world (Approx)
+            const x = (0.5 - lm.x) * 35;
+            const y = (0.5 - lm.y) * 25;
+            const z = -lm.z * 20; 
+            handPosition.lerp(new THREE.Vector3(x, y, z), 0.1); // Smooth transition
+        } else {
+            isHandDetected = false;
+        }
+    }
+}
+
+/**
+ * ----------------------------------------------------------------------
+ * 5. ANIMATION LOOP
+ * ----------------------------------------------------------------------
+ */
+function animate() {
+    requestAnimationFrame(animate);
+
+    detectHands(); // Try to update hand pos
+
+    const positions = geometry.attributes.position.array;
+    const sizes = geometry.attributes.size.array;
+    const colors = geometry.attributes.color.array;
+    const count = CONFIG.particleCount;
+
+    // ATTRACTOR: Hand or Center
+    let attractor = handPosition;
+    if (!webcamRunning && !isHandDetected && mouse.x === 0 && mouse.y === 0) {
+        // Idle animation if no input
+        const time = Date.now() * 0.001;
+        attractor = new THREE.Vector3(Math.sin(time)*10, Math.cos(time*0.5)*5, 0);
+    }
+
+    // PHYSICS UPDATE
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+
+        // Target position in world space
+        const tx = targetPositions[i3] + attractor.x;
+        const ty = targetPositions[i3+1] + attractor.y;
+        const tz = targetPositions[i3+2] + attractor.z;
+
+        // Force
+        const dx = tx - positions[i3];
+        const dy = ty - positions[i3+1];
+        const dz = tz - positions[i3+2];
+
+        velocities[i3] += dx * 0.015;
+        velocities[i3+1] += dy * 0.015;
+        velocities[i3+2] += dz * 0.015;
+
+        // Friction
+        velocities[i3] *= 0.90;
+        velocities[i3+1] *= 0.90;
+        velocities[i3+2] *= 0.90;
+
+        // Update
+        positions[i3] += velocities[i3];
+        positions[i3+1] += velocities[i3+1];
+        positions[i3+2] += velocities[i3+2];
+
+        // Comet Tail Visuals (Speed based)
+        const speed = Math.sqrt(velocities[i3]**2 + velocities[i3+1]**2 + velocities[i3+2]**2);
+        sizes[i] = CONFIG.baseSize + (speed * 0.8);
+        
+        // Color Shift based on speed (Cyan to White)
+        colors[i3] = 0.0 + speed * 0.5; // R
+        colors[i3+1] = 1.0 - speed * 0.1; // G
+        colors[i3+2] = 1.0; // B
+    }
+
+    geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.size.needsUpdate = true;
+    geometry.attributes.color.needsUpdate = true;
+
+    // TRAIL EFFECT (Manual Fade)
+    renderer.autoClearColor = false;
+    const fadeMaterial = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: CONFIG.trailStrength
+    });
+    // Create or reuse fade plane
+    let fadePlane = scene.getObjectByName('fader');
+    if (!fadePlane) {
+        fadePlane = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), fadeMaterial);
+        fadePlane.name = 'fader';
+        fadePlane.position.z = -1;
+        camera.add(fadePlane);
+        scene.add(camera);
+    }
+    
+    renderer.render(scene, camera);
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+</script>
+</body>
+</html>

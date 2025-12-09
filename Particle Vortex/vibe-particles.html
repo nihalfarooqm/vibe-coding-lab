@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js + MediaPipe Vibe Coding</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: sans-serif; }
+        canvas { display: block; }
+        /* UI Container is handled by dat.gui, but we add a loading overlay */
+        #loader {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ff88;
+            font-size: 24px;
+            pointer-events: none;
+            text-align: center;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid #00ff88;
+            z-index: 999;
+        }
+        /* Hide the webcam video element, we only need the data */
+        #video-input { display: none; }
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/vision_bundle.js"></script>
+</head>
+<body>
+
+    <div id="loader">Initializing AI & Particles...<br><span style="font-size:16px; color:#aaa;">Please allow camera access</span></div>
+    <video id="video-input" autoplay playsinline></video>
+
+<script>
+/**
+ * CONFIGURATION & GLOBAL STATE
+ */
+const CONFIG = {
+    particleCount: 15000,
+    shape: 'Sphere',
+    color: 0x00ffff,
+    baseSize: 0.15, // Reduced for better point definition
+    trailStrength: 0.12 // Lower is longer trails
+};
+
+let scene, camera, renderer, particles, geometry, material;
+let targetPositions = []; // To store the destination shape
+let currentPositions = []; // Current physics positions
+let velocities = [];       // Physics velocity
+let handLandmarker = null;
+let webcamRunning = false;
+let handPosition = new THREE.Vector3(0, 0, 0); // Tracks Index Finger Tip
+let isHandDetected = false;
+
+// Shapes Enumeration
+const SHAPES = ['Sphere', 'Cube', 'Torus', 'Helix', 'Spiral', 'Cone', 'Pyramid', 'Grid'];
+
+/**
+ * 1. INITIALIZATION
+ */
+async function init() {
+    // A. Three.js Setup
+    scene = new THREE.Scene();
+    
+    // Camera
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 30;
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    // Important for trails: We don't auto-clear, we draw a semi-transparent rect manually
+    renderer.autoClear = false; 
+    document.body.appendChild(renderer.domElement);
+
+    // B. UI Setup (dat.gui)
+    const gui = new dat.GUI();
+    gui.add(CONFIG, 'shape', SHAPES).name('Formation Shape').onChange(generateShapeTargets);
+    gui.add(CONFIG, 'particleCount', 500, 50000).step(100).name('Particle Amount').onFinishChange(initParticles);
+    
+    // C. Initialize Particles
+    initParticles();
+
+    // D. Initialize MediaPipe
+    await setupMediaPipe();
+
+    // E. Start Loop
+    document.getElementById('loader').style.display = 'none';
+    animate();
+
+    // Handle Resize
+    window.addEventListener('resize', onWindowResize, false);
+}
+
+/**
+ * 2. PARTICLE SYSTEM
+ */
+function initParticles() {
+    // Cleanup old if exists
+    if (particles) {
+        scene.remove(particles);
+        geometry.dispose();
+        material.dispose();
+    }
+
+    const count = Math.floor(CONFIG.particleCount);
+    geometry = new THREE.BufferGeometry();
+    currentPositions = new Float32Array(count * 3);
+    targetPositions = new Float32Array(count * 3);
+    velocities = new Float32Array(count * 3);
+    
+    // Colors and Sizes attributes for the shader
+    const colors = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+
+    const colorObj = new THREE.Color(CONFIG.color);
+
+    for (let i = 0; i < count; i++) {
+        // Start at random positions
+        currentPositions[i*3] = (Math.random() - 0.5) * 50;
+        currentPositions[i*3+1] = (Math.random() - 0.5) * 50;
+        currentPositions[i*3+2] = (Math.random() - 0.5) * 50;
+        
+        velocities[i*3] = 0;
+        velocities[i*3+1] = 0;
+        velocities[i*3+2] = 0;
+
+        // Base Color
+        colors[i*3] = colorObj.r;
+        colors[i*3+1] = colorObj.g;
+        colors[i*3+2] = colorObj.b;
+
+        sizes[i] = CONFIG.baseSize;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    // Custom Shader Material for better control over size and color vibe
+    material = new THREE.ShaderMaterial({
+        uniforms: {
+            pointTexture: { value: new THREE.TextureLoader().load("https://threejs.org/examples/textures/sprites/spark1.png") }
+        },
+        vertexShader: `
+            attribute float size;
+            attribute vec3 color;
+            varying vec3 vColor;
+            void main() {
+                vColor = color;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `,
+        fragmentShader: `
+            uniform sampler2D pointTexture;
+            varying vec3 vColor;
+            void main() {
+                gl_FragColor = vec4(vColor, 1.0);
+                gl_FragColor = gl_FragColor * texture2D(pointTexture, gl_PointCoord);
+            }
+        `,
+        blending: THREE.AdditiveBlending,
+        depthTest: false,
+        transparent: true
+    });
+
+    particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+
+    // Calculate initial shape
+    generateShapeTargets();
+}
+
+/**
+ * 3. SHAPE GENERATION LOGIC
+ */
+function generateShapeTargets() {
+    const count = Math.floor(CONFIG.particleCount);
+    const shape = CONFIG.shape;
+    const size = 10; // Base scale of shapes
+
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        let x, y, z;
+
+        if (shape === 'Sphere') {
+            const r = size * Math.cbrt(Math.random());
+            const theta = Math.random() * 2 * Math.PI;
+            const phi = Math.acos(2 * Math.random() - 1);
+            x = r * Math.sin(phi) * Math.cos(theta);
+            y = r * Math.sin(phi) * Math.sin(theta);
+            z = r * Math.cos(phi);
+        } 
+        else if (shape === 'Cube') {
+            x = (Math.random() - 0.5) * size * 2;
+            y = (Math.random() - 0.5) * size * 2;
+            z = (Math.random() - 0.5) * size * 2;
+        }
+        else if (shape === 'Torus') {
+            const R = size * 0.7; 
+            const r = size * 0.3;
+            const u = Math.random() * Math.PI * 2;
+            const v = Math.random() * Math.PI * 2;
+            x = (R + r * Math.cos(v)) * Math.cos(u);
+            y = (R + r * Math.cos(v)) * Math.sin(u);
+            z = r * Math.sin(v);
+        }
+        else if (shape === 'Helix') {
+            const t = i / count * 10 * Math.PI; // 5 turns
+            x = (size * 0.5) * Math.cos(t);
+            y = (size * 0.5) * Math.sin(t);
+            z = (i / count - 0.5) * size * 2;
+        }
+        else if (shape === 'Spiral') {
+            const angle = i * 0.1;
+            const radius = Math.sqrt(i) / Math.sqrt(count) * size;
+            x = radius * Math.cos(angle);
+            y = radius * Math.sin(angle);
+            z = 0;
+        }
+        else if (shape === 'Cone') {
+            const h = size * 2;
+            const y_norm = Math.random();
+            const r = (1 - y_norm) * size;
+            const theta = Math.random() * 2 * Math.PI;
+            x = r * Math.cos(theta);
+            y = y_norm * h - h/2;
+            z = r * Math.sin(theta);
+        }
+        else if (shape === 'Pyramid') {
+            const h = size * 2;
+            const y_norm = Math.random(); // 0 to 1 (base to tip)
+            const r = (1 - y_norm) * size; // radius shrinks as y goes up
+            // Square base logic
+            x = (Math.random() - 0.5) * 2 * r;
+            z = (Math.random() - 0.5) * 2 * r;
+            y = y_norm * h - h/2;
+        }
+        else if (shape === 'Grid') {
+            const dim = Math.cbrt(count);
+            const spacing = size * 2 / dim;
+            const ix = i % dim;
+            const iy = Math.floor((i / dim)) % dim;
+            const iz = Math.floor(i / (dim * dim));
+            x = ix * spacing - size;
+            y = iy * spacing - size;
+            z = iz * spacing - size;
+        }
+
+        targetPositions[i3] = x;
+        targetPositions[i3+1] = y;
+        targetPositions[i3+2] = z;
+    }
+}
+
+/**
+ * 4. MEDIAPIPE HAND TRACKING
+ */
+async function setupMediaPipe() {
+    const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+    );
+
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1
+    });
+
+    const video = document.getElementById("video-input");
+    
+    // Get Webcam Stream
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", () => {
+            webcamRunning = true;
+        });
+    } catch (err) {
+        alert("Camera permission denied. The visualizer will still work with mouse interaction.");
+    }
+}
+
+async function detectHands() {
+    if (!handLandmarker || !webcamRunning) return;
+    
+    const video = document.getElementById("video-input");
+    if (video.currentTime > 0) {
+        const results = await handLandmarker.detectForVideo(video, performance.now());
+        
+        if (results.landmarks && results.landmarks.length > 0) {
+            isHandDetected = true;
+            const landmarks = results.landmarks[0];
+            // Get Index Finger Tip (Landmark 8)
+            const indexTip = landmarks[8];
+            
+            // Map Video Coordinates (0-1) to 3D World Space
+            // Inverting X because webcam is mirrored usually
+            const x = (0.5 - indexTip.x) * 30; 
+            const y = (0.5 - indexTip.y) * 20; 
+            const z = -indexTip.z * 20; // Depth approximation
+            
+            handPosition.set(x, y, z);
+        } else {
+            isHandDetected = false;
+        }
+    }
+}
+
+/**
+ * 5. ANIMATION LOOP
+ */
+function animate() {
+    requestAnimationFrame(animate);
+
+    detectHands();
+
+    const positions = geometry.attributes.position.array;
+    const sizes = geometry.attributes.size.array;
+    const colors = geometry.attributes.color.array;
+    const count = CONFIG.particleCount;
+
+    // Center of the formation (The attractor)
+    // If hand detected, use hand. If not, float in center.
+    const attractor = isHandDetected ? handPosition : new THREE.Vector3(0, 0, 0);
+
+    // Physics Update
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+
+        // 1. Calculate Force towards target shape (which is offset by attractor)
+        const tx = targetPositions[i3] + attractor.x;
+        const ty = targetPositions[i3+1] + attractor.y;
+        const tz = targetPositions[i3+2] + attractor.z;
+
+        const dx = tx - positions[i3];
+        const dy = ty - positions[i3+1];
+        const dz = tz - positions[i3+2];
+
+        // Spring physics
+        velocities[i3] += dx * 0.02;
+        velocities[i3+1] += dy * 0.02;
+        velocities[i3+2] += dz * 0.02;
+
+        // Damping (Friction)
+        velocities[i3] *= 0.92;
+        velocities[i3+1] *= 0.92;
+        velocities[i3+2] *= 0.92;
+
+        // Apply Velocity
+        positions[i3] += velocities[i3];
+        positions[i3+1] += velocities[i3+1];
+        positions[i3+2] += velocities[i3+2];
+
+        // 2. Comet Effect Logic
+        // Velocity magnitude determines size (faster = stretched/bigger)
+        const speed = Math.sqrt(velocities[i3]**2 + velocities[i3+1]**2 + velocities[i3+2]**2);
+        
+        // Manipulate Size based on speed
+        sizes[i] = CONFIG.baseSize + (speed * 0.5);
+
+        // Manipulate Color brightness based on speed (Energy effect)
+        // Tint towards white when moving fast
+        colors[i3] = 0 + (speed * 0.5);   // R
+        colors[i3+1] = 1 - (speed * 0.1); // G
+        colors[i3+2] = 1;                 // B
+    }
+
+    geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.size.needsUpdate = true;
+    geometry.attributes.color.needsUpdate = true;
+
+    // Trail Effect:
+    // Instead of renderer.clear(), we draw a semi-transparent black rectangle.
+    // This creates the "fading trail" effect as previous frames persist slightly.
+    renderer.autoClearColor = false;
+    const fadeMaterial = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: CONFIG.trailStrength
+    });
+    const fadePlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(1000, 1000),
+        fadeMaterial
+    );
+    fadePlane.position.z = -1; // Put behind everything but in front of clear
+    fadePlane.lookAt(camera.position); // Always face camera
+    
+    // We can't easily draw a rect in 3D scene for clearing without blocking.
+    // Easier approach: Use a separate FullScreenQuad pass, OR simplest:
+    // Just create a large Quad parented to camera.
+    if (!scene.getObjectByName('fader')) {
+        fadePlane.name = 'fader';
+        camera.add(fadePlane);
+        scene.add(camera);
+    }
+    
+    renderer.render(scene, camera);
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// Start
+init();
+
+</script>
+</body>
+</html>
