@@ -5,6 +5,7 @@ A curious-filled lab of experimental web coding, rapidly prototyped and shaped u
 **"A curious-filled lab of experimental web coding, rapidly prototyped and shaped using powerful Generative AI models."**
 
 This repository is dedicated to exploring the intersection of generative AI and complex front-end development. We use AI assistants (like Gemini) to quickly build intricate web projects that would traditionally take hours or days to set up.
+Lab page: https://nihalfarooqm.github.io/vibe-coding-lab/
 
 ## 📁 Projects & Experiments
 
