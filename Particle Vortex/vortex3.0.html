@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Controlled Particle Vortex</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #canvas-container {
+            width: 100%;
+            height: 100vh;
+            display: block;
+        }
+        /* Hide the raw video input, we only need the data */
+        #video-input {
+            position: absolute;
+            top: 0;
+            left: 0;
+            visibility: hidden;
+            width: 1px; height: 1px;
+        }
+        /* UI Panel Styling */
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(15, 23, 42, 0.8); /* Dark translucent blue */
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #e2e8f0;
+            width: 250px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            z-index: 100;
+        }
+        #ui-panel h2 { margin-top: 0; font-size: 1.2rem; color: #38bdf8; text-align: center;}
+        .control-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: 600; font-size: 0.9rem;}
+        select, input[type=range] {
+            width: 100%;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #475569;
+            background: #1e293b;
+            color: white;
+        }
+        select:focus, input:focus { outline: 2px solid #38bdf8; }
+        #particle-count-val { text-align: right; display: block; font-size: 0.8rem; color: #94a3b8;}
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #38bdf8; font-size: 1.5rem; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading AI Models & Engine...</div>
+    <canvas id="canvas-container"></canvas>
+    <video id="video-input" autoplay playsinline></video>
+
+    <div id="ui-panel" style="display:none;">
+        <h2>Vortex Controls</h2>
+        <div class="control-group">
+            <label for="shape-selector">Formation Shape</label>
+            <select id="shape-selector">
+                <option value="sphere">Sphere</option>
+                <option value="cube">Cube</option>
+                <option value="torus">Torus (Donut)</option>
+                <option value="helix">Helix (DNA)</option>
+                <option value="cone">Cone</option>
+                <option value="spiral">Flat Spiral</option>
+                <option value="grid">Grid Plane</option>
+                <option value="heart">Heart</option>
+                <option value="ring">Saturn Ring</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label for="particle-slider">Particle Amount</label>
+            <input type="range" id="particle-slider" min="500" max="50000" step="500" value="10000">
+            <span id="particle-count-val">10000 particles</span>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+        import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/+esm';
+
+        // --- Configuration ---
+        const MAX_PARTICLES = 50000;
+        let activeParticleCount = 10000;
+        let currentShapeStr = 'sphere';
+        let handTargetWorldPos = new THREE.Vector3(0, 0, 0);
+        let isHandDetected = false;
+        const WORLD_SCALE = 20; // Scale up MediaPipe coords to Three.js world size
+
+        // --- Three.js Setup ---
+        const canvas = document.getElementById('canvas-container');
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        const scene = new THREE.Scene();
+        // Add slight fog for depth
+        scene.fog = new THREE.FogExp2(0x000000, 0.01);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 50;
+
+        // --- Particle System Setup ---
+        // Generate a simple "star" texture programmatically for the particles
+        function getTexture() {
+            const ctx = document.createElement('canvas').getContext('2d');
+            ctx.canvas.width = ctx.canvas.height = 64;
+            const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 64, 64);
+            const texture = new THREE.CanvasTexture(ctx.canvas);
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        const particleGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(MAX_PARTICLES * 3);
+        const colors = new Float32Array(MAX_PARTICLES * 3);
+        const sizes = new Float32Array(MAX_PARTICLES);
+        // Custom data to store current velocity for physics
+        const velocities = []; 
+        // Custom data to store where the particle *wants* to be based on the shape
+        const targetPositions = [];
+
+        for (let i = 0; i < MAX_PARTICLES; i++) {
+            // Initialize way outside view
+            positions[i * 3] = (Math.random() - 0.5) * 500;
+            positions[i * 3 + 1] = (Math.random() - 0.5) * 500;
+            positions[i * 3 + 2] = (Math.random() - 0.5) * 500;
+            
+            colors[i * 3] = 1; colors[i * 3 + 1] = 1; colors[i * 3 + 2] = 1;
+            sizes[i] = 1.0;
+
+            velocities.push(new THREE.Vector3(0,0,0));
+            targetPositions.push(new THREE.Vector3(0,0,0));
+        }
+
+        particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        particleGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        particleGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        particleGeometry.setDrawRange(0, activeParticleCount);
+
+        // Using PointsMaterial. For true variable size per particle, we'd need a custom shader, 
+        // but we can fake the "comet size change" illusion using colors and brightness.
+        const particleMaterial = new THREE.PointsMaterial({
+            size: 0.8,
+            map: getTexture(),
+            vertexColors: true,
+            blending: THREE.AdditiveBlending, // Makes them glow when overlapping
+            depthTest: false, // Important for transparency looking right
+            transparent: true,
+            opacity: 0.9
+        });
+
+        const particleSystem = new THREE.Points(particleGeometry, particleMaterial);
+        scene.add(particleSystem);
+
+        // --- Shape Calculation Logic ---
+        // These functions calculate ideal positions based on index 'i'
+        const shapes = {
+            sphere: (i, targetVec) => {
+                const phi = Math.acos(-1 + (2 * i) / activeParticleCount);
+                const theta = Math.sqrt(activeParticleCount * Math.PI) * phi;
+                const r = 15;
+                targetVec.setFromSphericalCoords(r, phi, theta);
+            },
+            cube: (i, targetVec) => {
+                const side = Math.cbrt(activeParticleCount);
+                const spacing = 25 / side;
+                const x = (i % side) * spacing - 12.5;
+                const y = (Math.floor(i / side) % side) * spacing - 12.5;
+                const z = Math.floor(i / (side * side)) * spacing - 12.5;
+                targetVec.set(x, y, z);
+            },
+            torus: (i, targetVec) => {
+                const R = 20; const r = 5;
+                const u = (i / activeParticleCount) * Math.PI * 2;
+                const v = (i / activeParticleCount) * Math.PI * 20;
+                targetVec.x = (R + r * Math.cos(v)) * Math.cos(u);
+                targetVec.y = (R + r * Math.cos(v)) * Math.sin(u);
+                targetVec.z = r * Math.sin(v);
+            },
+             helix: (i, targetVec) => {
+                const t = i / activeParticleCount;
+                const r = 10;
+                const h = 40;
+                const turns = 5;
+                targetVec.x = r * Math.cos(t * Math.PI * 2 * turns);
+                targetVec.z = r * Math.sin(t * Math.PI * 2 * turns);
+                targetVec.y = h * (t - 0.5);
+            },
+            cone: (i, targetVec) => {
+                 const h = 30;
+                 const maxR = 15;
+                 const t = i / activeParticleCount; // 0 to 1
+                 const currentY = h * (t - 0.5);
+                 const currentR = maxR * (1-t);
+                 const angle = t * Math.PI * 20; // lots of spins
+                 targetVec.x = currentR * Math.cos(angle);
+                 targetVec.z = currentR * Math.sin(angle);
+                 targetVec.y = currentY;
+            },
+             spiral: (i, targetVec) => {
+                const t = i / activeParticleCount;
+                const maxR = 25;
+                const angle = t * Math.PI * 2 * 10; // 10 spins
+                const r = t * maxR;
+                targetVec.x = r * Math.cos(angle);
+                targetVec.y = r * Math.sin(angle);
+                targetVec.z = 0;
+            },
+             grid: (i, targetVec) => {
+                 const gridSize = Math.sqrt(activeParticleCount);
+                 const spacing = 40 / gridSize;
+                 const x = (i % gridSize) * spacing - 20;
+                 const z = Math.floor(i / gridSize) * spacing - 20;
+                 targetVec.set(x, -10, z);
+            },
+             heart: (i, targetVec) => {
+                // parametric heart equation
+                let t = (i / activeParticleCount) * Math.PI * 2;
+                const s = 1.5;
+                targetVec.x = s * 16 * Math.pow(Math.sin(t), 3);
+                targetVec.y = s * (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t));
+                targetVec.z = (Math.random()-0.5) * 5; // slight thickness
+            },
+             ring: (i, targetVec) => {
+                 const rMin = 15; const rMax = 25;
+                 const t = i / activeParticleCount;
+                 const angle = t * Math.PI * 2;
+                 // Distribute randomly between inner and outer radius
+                 const r = Math.sqrt(Math.random() * (rMax*rMax - rMin*rMin) + rMin*rMin);
+                 targetVec.x = r * Math.cos(angle);
+                 targetVec.z = r * Math.sin(angle);
+                 targetVec.y = (Math.random()-0.5) * 2;
+             }
+
+        };
+
+        // --- MediaPipe Setup ---
+        const video = document.getElementById('video-input');
+        let handLandmarker = undefined;
+
+        async function setupMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+
+            // Get Camera Access
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                video.srcObject = stream;
+                video.addEventListener('loadeddata', () => {
+                     document.getElementById('loading').style.display = 'none';
+                     document.getElementById('ui-panel').style.display = 'block';
+                     animate();
+                });
+            } catch (err) {
+                alert("Camera access denied or not available. The app requires a camera for gestures.");
+                document.getElementById('loading').innerText = "Camera Error.";
+            }
+        }
+
+        // --- Main Animation Loop ---
+        const clock = new THREE.Clock();
+        let time = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            time += delta;
+
+            // 1. MediaPipe Detection
+            if (handLandmarker && video.currentTime > 0) {
+                const results = handLandmarker.detectForVideo(video, performance.now());
+                if (results.worldLandmarks && results.worldLandmarks.length > 0) {
+                    isHandDetected = true;
+                    // Index fingertip is landmark 8. 
+                    // MP coordinates are roughly -0.1 to 0.1 meters. We scale them up.
+                    // We also invert X/Y to match Three.js coordinate space relative to camera look direction
+                    const indexTip = results.worldLandmarks[0][8];
+                    handTargetWorldPos.set(-indexTip.x * WORLD_SCALE, -indexTip.y * WORLD_SCALE, -indexTip.z * WORLD_SCALE);
+                } else {
+                    isHandDetected = false;
+                }
+            }
+
+            // 2. Particle Physics Update
+            const positionsArr = particleGeometry.attributes.position.array;
+            const colorsArr = particleGeometry.attributes.color.array;
+
+            // Centers for attractions
+            const shapeCenter = new THREE.Vector3(0,0,0);
+            const attractPoint = isHandDetected ? handTargetWorldPos : shapeCenter;
+            
+            for (let i = 0; i < activeParticleCount; i++) {
+                const idx3 = i * 3;
+                const currentPos = new THREE.Vector3(positionsArr[idx3], positionsArr[idx3+1], positionsArr[idx3+2]);
+                const vel = velocities[i];
+
+                // A. Calculate Ideal Shape Position
+                shapes[currentShapeStr](i, targetPositions[i]);
+                
+                // B. Forces
+                // Force 1: Attraction to Hand (strong)
+                const handVec = new THREE.Vector3().subVectors(attractPoint, currentPos);
+                const handDistSq = handVec.lengthSq();
+                // Stronger pull when closer, capped distance to prevent crazy flinging
+                let pullStrength = isHandDetected ? 150 / Math.max(10, handDistSq) : 0.1; 
+                handVec.normalize().multiplyScalar(pullStrength);
+
+                // Force 2: Attraction to Shape Position (weaker, elastic)
+                const shapeVec = new THREE.Vector3().subVectors(targetPositions[i], currentPos);
+                shapeVec.multiplyScalar(0.8 * delta); // Elasticity
+
+                // C. Apply Forces & Physics
+                vel.add(handVec);
+                vel.add(shapeVec);
+                vel.multiplyScalar(0.92); // Damping/Friction (keeps things stable)
+                currentPos.add(vel.clone().multiplyScalar(delta * 20)); // Move
+
+                // D. Update Geometry Buffers
+                positionsArr[idx3] = currentPos.x;
+                positionsArr[idx3+1] = currentPos.y;
+                positionsArr[idx3+2] = currentPos.z;
+
+                // E. Comet Tail Color Effect
+                // Speed determines brightness and color temperature.
+                // Fast = White/Yellow hot. Slow = Blue/Purple cool.
+                const speed = vel.length();
+                const normalizedSpeed = Math.min(speed / 2.5, 1.0); // normalize speed roughly 0 to 1
+
+                // Interpolate between colors based on speed
+                const slowColor = new THREE.Color(0x38bdf8); // Sky blue
+                const fastColor = new THREE.Color(0xffaa55); // Yellow/Orange hot
+                const finalColor = slowColor.lerp(fastColor, normalizedSpeed);
+
+                // Brightness boost based on speed
+                const lightness = 0.3 + normalizedSpeed * 0.7;
+                
+                colorsArr[idx3] = finalColor.r * lightness;
+                colorsArr[idx3+1] = finalColor.g * lightness;
+                colorsArr[idx3+2] = finalColor.b * lightness;
+            }
+
+            // Important: tell Three.js buffers have changed
+            particleGeometry.attributes.position.needsUpdate = true;
+            particleGeometry.attributes.color.needsUpdate = true;
+            
+            // Slow rotation of the whole system for dynamism
+            if(!isHandDetected) {
+                particleSystem.rotation.y += delta * 0.1;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- UI Event Listeners ---
+        const shapeSelector = document.getElementById('shape-selector');
+        const particleSlider = document.getElementById('particle-slider');
+        const particleValDisplay = document.getElementById('particle-count-val');
+
+        shapeSelector.addEventListener('change', (e) => {
+            currentShapeStr = e.target.value;
+            // Reset velocities slightly for a "burst" effect on change
+            velocities.forEach(v => v.multiplyScalar(0.5));
+        });
+
+        particleSlider.addEventListener('input', (e) => {
+            activeParticleCount = parseInt(e.target.value);
+            particleValDisplay.innerText = `${activeParticleCount} particles`;
+            particleGeometry.setDrawRange(0, activeParticleCount);
+        });
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Initialize ---
+        setupMediaPipe();
+    </script>
+</body>
+</html>
